@@ -1,9 +1,10 @@
 /* gdb_stub.c — GDB Remote Serial Protocol stub for AttoRV32.
  *
  * Implements the minimum packet set for a useful debugging session:
- *   ? g G m M c s Z0 z0 qSupported qAttached Hg
+ *   ? g G m M c s Z0 z0 Z1 z1 qSupported qAttached Hg
  *
- * Software breakpoints via c.ebreak / ebreak overwrite.
+ * Software breakpoints (Z0/z0) via c.ebreak / ebreak overwrite.
+ * Hardware breakpoints (Z1/z1) via memory-mapped hw_bkpt unit.
  * Software single-step via next-PC prediction (no HW stepper).
  *
  * All code lives in ROM (combinational). Only g_regs[], the breakpoint
@@ -16,15 +17,31 @@
 /* ===================================================================
  * Platform UART I/O
  *
- * IO_BASE is passed by the build system (-DIO_BASE=0x0FF0).
+ * IO_BASE is passed by the build system (-DIO_BASE=0x2000).
  * =================================================================== */
 
 #ifndef IO_BASE
-#  define IO_BASE 0x0FF0
+#  define IO_BASE 0x2000
 #endif
 
-#define UART_DATA   (*(volatile uint32_t *)(IO_BASE + 0))
-#define UART_STATUS (*(volatile uint32_t *)(IO_BASE + 4))
+#define UART_DATA   (*(volatile uint32_t *)(IO_BASE + 0x00))
+#define UART_STATUS (*(volatile uint32_t *)(IO_BASE + 0x04))
+
+/* ===================================================================
+ * Hardware breakpoint registers (hw_bkpt unit, I/O peripheral)
+ *
+ * BP_BASE is the base address of the hw_bkpt register block.
+ * Sub-slot 1 within System Control slot (IO_BASE + 0x20).
+ * =================================================================== */
+
+#ifndef BP_BASE
+#  define BP_BASE (IO_BASE + 0x20)
+#endif
+
+#define BP_CTRL    (*(volatile uint32_t *)(BP_BASE + 0x00))  /* [N-1:0] enable */
+#define BP_HIT     (*(volatile uint32_t *)(BP_BASE + 0x04))  /* [N-1:0] hit (W1C) */
+#define BP_COUNT   (*(volatile uint32_t *)(BP_BASE + 0x08))  /* N (RO) */
+#define BP_ADDR(i) (*(volatile uint32_t *)(BP_BASE + 0x10 + (i) * 4))
 
 int gdb_uart_getc(void) {
     while (!(UART_STATUS & 0x2))     /* wait for RX valid */
@@ -266,6 +283,51 @@ static void remove_step_bps(void) {
 }
 
 /* ===================================================================
+ * Hardware breakpoint management (Z1/z1)
+ * =================================================================== */
+
+static int hw_bp_insert(uint32_t addr) {
+    uint32_t n = BP_COUNT;
+    uint32_t ctrl = BP_CTRL;
+    uint32_t i;
+
+    /* Check for duplicate. */
+    for (i = 0; i < n; i++)
+        if ((ctrl & (1u << i)) && BP_ADDR(i) == addr)
+            return 0;  /* already set */
+
+    /* Find a free slot. */
+    for (i = 0; i < n; i++) {
+        if (!(ctrl & (1u << i))) {
+            BP_ADDR(i) = addr;
+            BP_CTRL = ctrl | (1u << i);
+            return 0;
+        }
+    }
+    return -1;  /* all slots full */
+}
+
+static int hw_bp_remove(uint32_t addr) {
+    uint32_t n = BP_COUNT;
+    uint32_t ctrl = BP_CTRL;
+    uint32_t i;
+
+    for (i = 0; i < n; i++) {
+        if ((ctrl & (1u << i)) && BP_ADDR(i) == addr) {
+            BP_CTRL = ctrl & ~(1u << i);
+            BP_HIT = (1u << i);  /* W1C: clear hit flag */
+            return 0;
+        }
+    }
+    return -1;  /* not found */
+}
+
+/* Clear all hit flags before resuming execution. */
+static void hw_bp_clear_hits(void) {
+    BP_HIT = BP_HIT;  /* W1C: write back all set bits to clear them */
+}
+
+/* ===================================================================
  * Next-PC prediction for software single-step
  * =================================================================== */
 
@@ -477,41 +539,61 @@ static int cmd_step(const char *args) {
     return 1;  /* exit RSP loop → mret → hit step BP → re-enter */
 }
 
-/* 'Z0,addr,kind' — insert software breakpoint. */
+/* 'Z0,addr,kind' — insert software breakpoint.
+ * 'Z1,addr,kind' — insert hardware breakpoint. */
 static void cmd_insert_bp(const char *args) {
     const char *p = args;
-    if (*p == '0' && *(p + 1) == ',') {
-        p += 2;
-        uint32_t addr = parse_hex(&p);
-        if (bp_insert(addr, 0) == 0)
-            put_ok();
-        else
-            put_err();
+    char type = *p;
+    if (*(p + 1) != ',') { put_empty(); return; }
+    p += 2;
+    uint32_t addr = parse_hex(&p);
+
+    int rc;
+    if (type == '0') {
+        rc = bp_insert(addr, 0);
+    } else if (type == '1') {
+        rc = hw_bp_insert(addr);
     } else {
         put_empty();  /* unsupported BP type */
+        return;
     }
+
+    if (rc == 0)
+        put_ok();
+    else
+        put_err();
 }
 
-/* 'z0,addr,kind' — remove software breakpoint. */
+/* 'z0,addr,kind' — remove software breakpoint.
+ * 'z1,addr,kind' — remove hardware breakpoint. */
 static void cmd_remove_bp(const char *args) {
     const char *p = args;
-    if (*p == '0' && *(p + 1) == ',') {
-        p += 2;
-        uint32_t addr = parse_hex(&p);
-        if (bp_remove(addr, 0) == 0)
-            put_ok();
-        else
-            put_err();
+    char type = *p;
+    if (*(p + 1) != ',') { put_empty(); return; }
+    p += 2;
+    uint32_t addr = parse_hex(&p);
+
+    int rc;
+    if (type == '0') {
+        rc = bp_remove(addr, 0);
+    } else if (type == '1') {
+        rc = hw_bp_remove(addr);
     } else {
         put_empty();
+        return;
     }
+
+    if (rc == 0)
+        put_ok();
+    else
+        put_err();
 }
 
 /* 'q...' — query packets. */
 static void cmd_query(const char *args) {
     /* qSupported */
     if (args[0] == 'S' && args[1] == 'u') {
-        put_packet("PacketSize=200;swbreak+");
+        put_packet("PacketSize=200;swbreak+;hwbreak+");
         return;
     }
     /* qAttached */
@@ -591,6 +673,9 @@ void gdb_stub_entry(uint32_t cause) {
 
         if (resume) break;
     }
+
+    /* Clear hardware breakpoint hit flags before resuming. */
+    hw_bp_clear_hits();
 
     /* On return, crt0_stub.S restores g_regs[] → registers, mepc, mret. */
 }

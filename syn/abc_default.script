@@ -1,0 +1,16 @@
+strash
+ifraig; scorr; dc2; dretime; strash
+ifraig; scorr; dc2; dretime; strash
+ifraig; scorr; dc2; dretime; strash
+ifraig; scorr; dc2; dretime; strash
+&get -n
+&dch -f
+&nf {D}
+&put
+buffer -c
+topo
+stime -c
+upsize {D} -c
+dnsize {D} -c
+stime -p
+print_stats -m

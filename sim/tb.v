@@ -64,7 +64,8 @@ module tb;
       .mem_wbusy         (mem_wbusy),
       .interrupt_request (irq_line),
       .nmi               (1'b0),
-      .dbg_halt_req      (1'b0)
+      .dbg_halt_req      (1'b0),
+      .pc_out            ()
    );
 
    // --------------------------------------------------------------------

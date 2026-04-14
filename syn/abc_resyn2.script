@@ -1,0 +1,12 @@
+strash
+dch -f
+balance; drw -l; drf -l; balance; drw -l; drw -l -z; balance; drf -l -z; drw -l -z; balance
+balance; drw -l; drf -l; balance; drw -l; drw -l -z; balance; drf -l -z; drw -l -z; balance
+map -p -a -B 0.2 -A 0.9 -M 0
+topo
+stime -c
+buffer -c
+upsize -c
+dnsize -c
+stime -p
+print_stats -m

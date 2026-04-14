@@ -1,30 +1,33 @@
 /*-----------------------------------------------------------------------------
  * attorv32_dbg.v — Minimal debug SoC: core + RAM + stub ROM + UART.
  *
- * Memory map  (ADDR_WIDTH = RAM_AW + 1):
+ * Memory map (16-bit address space, page-aligned regions):
  *
- *   0x0000 – (2^RAM_AW – 17) : RAM  (read/write)
- *   (2^RAM_AW – 16) – (2^RAM_AW – 1) : I/O  (UART + control)
- *   2^RAM_AW – (2^(RAM_AW+1) – 1) : stub ROM  (combinational, read-only)
+ *   0x0000 – 0x0FFF : RAM  (4 KiB, read/write, synchronous SRAM)
+ *   0x1000 – 0x1FFF : Stub ROM  (4 KiB, combinational, read-only)
+ *   0x2000 – 0x2FFF : I/O  (4 KiB = 16 peripheral slots × 256 bytes)
  *
- * Example with RAM_AW=12 → ADDR_WIDTH=13 (8 KiB total):
- *   0x0000 – 0x0FEF : 4080 bytes RAM
- *   0x0FF0 – 0x0FFF : I/O (4 × 32-bit registers)
- *   0x1000 – 0x1FFF : 4 KiB stub ROM
+ * Address decode: mem_addr[15:12]
+ *   4'h0 → RAM     4'h1 → ROM     4'h2 → I/O
  *
- * The MSB of the address selects ROM vs RAM/IO.
- * Within the RAM/IO half, the top 16 bytes are IO.
+ * I/O slot 0 (0x2000–0x20FF) — System Control:
+ *   8 sub-slots × 32 bytes, decoded by mem_addr[7:5].
+ *   Each sub-slot has 8 word-aligned registers (mem_addr[4:2]).
  *
- * MTVEC_ADDR is set to the ROM base so every trap lands in the
- * ROM-resident ISR + GDB stub — no RAM is needed for trap code.
+ *   Sub  [7:5]  Address   Block             Registers
+ *    0   000    0x2000    UART              DATA, STATUS
+ *    1   001    0x2020    HW Breakpoints    BP_CTRL, BP_HIT, BP_COUNT, rsvd,
+ *                                           BP_ADDR[0], BP_ADDR[1], BP_ADDR[2], BP_ADDR[3]
+ *    2   010    0x2040    System Timer      (TBD)
+ *    3   011    0x2060    PIC               (TBD)
+ *    4   100    0x2080    Clocking          (TBD)
+ *    5   101    0x20A0    Control           CTRL (write 1 → $finish, bench only)
+ *    6   110    0x20C0    (reserved)
+ *    7   111    0x20E0    (reserved)
  *
- * Reset vector is 0x0000 (RAM), containing a c.j to _start.
+ * Slots 1–15 (0x2100–0x2FFF) — User peripherals (reserved / future).
  *
- * I/O register map (accent on UART for GDB RSP):
- *   +0x0 (IO_BASE+0)  UART_DATA   [7:0]  TX on write, RX on read
- *   +0x4 (IO_BASE+4)  UART_STATUS [0] TX ready  [1] RX valid
- *   +0x8 (IO_BASE+8)  reserved
- *   +0xC (IO_BASE+12) CTRL        [0] write 1 → finish sim (bench only)
+ * MTVEC_ADDR = ROM base (0x1000). Reset vector = 0x0000 (RAM).
  *---------------------------------------------------------------------------*/
 
 module attorv32_dbg #(
@@ -45,10 +48,9 @@ module attorv32_dbg #(
    /*---------------------------------------------------------------*/
    /* Derived constants                                             */
    /*---------------------------------------------------------------*/
-   localparam ADDR_WIDTH = RAM_AW + 1;           // total address space
-   localparam ROM_BASE   = (1 << RAM_AW);        // e.g. 0x1000
-   localparam IO_BASE    = ROM_BASE - 16;        // e.g. 0x0FF0
-   localparam ROM_AW     = RAM_AW;               // ROM same size as RAM half
+   localparam ADDR_WIDTH = RAM_AW + 2;           // covers RAM + ROM + I/O
+   localparam ROM_BASE   = (1 << RAM_AW);        // 0x1000
+   localparam ROM_AW     = RAM_AW;               // ROM same size as RAM
 
    /*---------------------------------------------------------------*/
    /* CPU instance                                                  */
@@ -60,6 +62,8 @@ module attorv32_dbg #(
    wire        mem_rstrb;
    wire        mem_rbusy;
    wire        mem_wbusy;
+   wire [ADDR_WIDTH-1:0] core_pc;
+   wire        bp_halt;
 
    AttoRV32 #(
       .ADDR_WIDTH (ADDR_WIDTH),
@@ -77,20 +81,35 @@ module attorv32_dbg #(
       .mem_wbusy         (mem_wbusy),
       .interrupt_request (irq),
       .nmi               (1'b0),
-      .dbg_halt_req      (uart_break)     // UART break → debug halt
+      .dbg_halt_req      (uart_break | bp_halt),
+      .pc_out            (core_pc)
    );
 
    /*---------------------------------------------------------------*/
    /* Address decode                                                */
    /*---------------------------------------------------------------*/
-   wire sel_rom = mem_addr[RAM_AW];                                   // MSB = 1
-   wire sel_io  = ~sel_rom & (mem_addr[RAM_AW-1:4] == {(RAM_AW-4){1'b1}}); // top 16 B of RAM half
-   wire sel_ram = ~sel_rom & ~sel_io;
+   wire [3:0] page_sel = mem_addr[15:12];
+
+   wire sel_ram = (page_sel == 4'h0);            // 0x0000–0x0FFF
+   wire sel_rom = (page_sel == 4'h1);            // 0x1000–0x1FFF
+   wire sel_io  = (page_sel == 4'h2);            // 0x2000–0x2FFF
+
+   // I/O: 16 peripheral slots × 256 bytes
+   wire [3:0] io_slot = mem_addr[11:8];          // slot number
+
+   // Slot 0 — System Control: 8 sub-slots × 32 bytes
+   wire       sel_sys     = sel_io & (io_slot == 4'd0);
+   wire [2:0] sys_subslot = mem_addr[7:5];       // sub-slot within slot 0
+   wire [2:0] sys_reg     = mem_addr[4:2];       // register within sub-slot
+
+   wire sel_uart = sel_sys & (sys_subslot == 3'd0);
+   wire sel_bkpt = sel_sys & (sys_subslot == 3'd1);
+   wire sel_ctrl = sel_sys & (sys_subslot == 3'd5);
 
    /*---------------------------------------------------------------*/
-   /* RAM (behavioural; replace with SRAM macro for silicon)        */
+   /* RAM (synchronous read/write; maps to real SRAM)              */
    /*---------------------------------------------------------------*/
-   localparam RAM_WORDS = (1 << RAM_AW) / 4;   // e.g. 1024
+   localparam RAM_WORDS = (1 << RAM_AW) / 4;
 
    reg [31:0] ram [0:RAM_WORDS-1];
 
@@ -103,7 +122,9 @@ module attorv32_dbg #(
       if (sel_ram & mem_wmask[3]) ram[ram_waddr][31:24] <= mem_wdata[31:24];
    end
 
-   wire [31:0] ram_rdata = ram[mem_addr[RAM_AW-1:2]];
+   reg [31:0] ram_rdata;
+   always @(posedge clk)
+      ram_rdata <= ram[mem_addr[RAM_AW-1:2]];
 
    /*---------------------------------------------------------------*/
    /* Stub ROM (combinational — no clock)                           */
@@ -111,88 +132,144 @@ module attorv32_dbg #(
    wire [31:0] rom_rdata;
 
    stub_rom #(
-      .AW  (ROM_AW - 2)              // word-address width
+      .AW  (ROM_AW - 2)
    ) u_rom (
       .addr  (mem_addr[ROM_AW-1:2]),
       .rdata (rom_rdata)
    );
 
    /*---------------------------------------------------------------*/
-   /* I/O registers (directly instantiated — no sub-module)         */
-   /*                                                               */
-   /* Replace the UART stub below with a real UART for silicon.     */
-   /* For simulation, a behavioural model is enough.                */
+   /* Sub-slot 0: UART                                              */
    /*---------------------------------------------------------------*/
+   wire uart_wr_en = sel_uart & (sys_reg == 3'd0) & |mem_wmask;
+   wire uart_rd_en = sel_uart & (sys_reg == 3'd0) & mem_rstrb;
+
+`ifdef BENCH
    reg  [7:0] uart_tx_data;
    reg        uart_tx_valid;
    reg  [7:0] uart_rx_data;
    reg        uart_rx_valid;
-
-   wire [1:0] io_reg_sel = mem_addr[3:2];   // 0..3
-
-   reg  [31:0] io_rdata;
-   always @(*) begin
-      case (io_reg_sel)
-         2'd0:    io_rdata = {24'b0, uart_rx_data};        // UART_DATA
-         2'd1:    io_rdata = {30'b0, uart_rx_valid, 1'b1}; // UART_STATUS (TX always ready for now)
-         default: io_rdata = 32'b0;
-      endcase
-   end
+   wire       uart_tx_ready = 1'b1;
+   wire       uart_baud_locked = 1'b1;
 
    always @(posedge clk) begin
       if (!resetn) begin
          uart_tx_valid <= 1'b0;
          uart_rx_valid <= 1'b0;
       end else begin
-         // TX: write to UART_DATA
-         if (sel_io & (io_reg_sel == 2'd0) & |mem_wmask) begin
+         if (uart_wr_en) begin
             uart_tx_data  <= mem_wdata[7:0];
             uart_tx_valid <= 1'b1;
-`ifdef BENCH
             $write("%c", mem_wdata[7:0]);
-`endif
          end else begin
             uart_tx_valid <= 1'b0;
          end
-
-         // RX: read from UART_DATA clears rx_valid
-         if (sel_io & (io_reg_sel == 2'd0) & mem_rstrb)
+         if (uart_rd_en)
             uart_rx_valid <= 1'b0;
-
-`ifdef BENCH
-         // Simulation finish on write to CTRL register
-         if (sel_io & (io_reg_sel == 2'd3) & |mem_wmask)
+         if (sel_ctrl & |mem_wmask)
             $finish;
-`endif
       end
    end
 
-   // Stub UART pins (replace with real UART TX/RX serdes for silicon)
-   assign uart_tx = 1'b1;    // idle high
+   assign uart_tx = 1'b1;
    wire _unused_rx = uart_rx;
 
-   /*---------------------------------------------------------------*/
-   /* UART break detector → dbg_halt_req                            */
-   /*                                                               */
-   /* A serial "break" is RX held low for longer than one frame.    */
-   /* GDB sends this when the user hits Ctrl-C. We detect it with   */
-   /* a saturating counter and pulse dbg_halt_req — this forces a   */
-   /* trap into the ROM stub regardless of MIE.                     */
-   /*---------------------------------------------------------------*/
+   /* Break detector (simple counter for simulation) */
    reg [3:0] brk_cnt;
    always @(posedge clk) begin
       if (!resetn)       brk_cnt <= 4'd0;
-      else if (uart_rx)  brk_cnt <= 4'd0;          // RX high → reset
-      else if (~(&brk_cnt)) brk_cnt <= brk_cnt + 1; // count while low (saturate at 15)
+      else if (uart_rx)  brk_cnt <= 4'd0;
+      else if (~(&brk_cnt)) brk_cnt <= brk_cnt + 1;
    end
-   wire uart_break = &brk_cnt;  // RX low for 15+ cycles → break
+   wire uart_break = &brk_cnt;
+
+`else
+   wire [7:0] uart_rx_data;
+   wire       uart_rx_valid;
+   wire       uart_tx_ready;
+   wire       uart_baud_locked;
+   wire       uart_break;
+
+   dbg_uart u_uart (
+      .clk      (clk),
+      .resetn   (resetn),
+      .rx_pin   (uart_rx),
+      .tx_pin   (uart_tx),
+      .wr_data  (mem_wdata[7:0]),
+      .wr_en    (uart_wr_en),
+      .tx_ready (uart_tx_ready),
+      .rd_data  (uart_rx_data),
+      .rd_valid (uart_rx_valid),
+      .rd_en    (uart_rd_en),
+      .brk      (uart_break),
+      .locked   (uart_baud_locked)
+   );
+
+   always @(posedge clk) begin
+`ifdef BENCH_FINISH
+      if (sel_ctrl & |mem_wmask)
+         $finish;
+`endif
+   end
+`endif
+
+   /*---------------------------------------------------------------*/
+   /* Sub-slot 1: Hardware breakpoints (4 slots)                    */
+   /*---------------------------------------------------------------*/
+   wire [31:0] bp_rdata;
+
+   hw_bkpt #(
+      .N          (4),
+      .ADDR_WIDTH (ADDR_WIDTH)
+   ) u_bkpt (
+      .clk      (clk),
+      .resetn   (resetn),
+      .pc_in    (core_pc),
+      .halt_req (bp_halt),
+      .sel      (sel_bkpt),
+      .reg_addr (sys_reg),                       // 3-bit word offset within 32-byte sub-slot
+      .wdata    (mem_wdata),
+      .wmask    (mem_wmask),
+      .rstrb    (mem_rstrb),
+      .rdata    (bp_rdata)
+   );
+
+   /*---------------------------------------------------------------*/
+   /* Slot 0 (System Control) read mux                              */
+   /*                                                                */
+   /* sys_subslot  Block                                             */
+   /*   0          UART: reg 0 = DATA, reg 1 = STATUS               */
+   /*   1          HW breakpoints                                    */
+   /*   5          Control                                           */
+   /*---------------------------------------------------------------*/
+   reg  [31:0] sys_rdata;
+   always @(*) begin
+      case (sys_subslot)
+         3'd0: begin    // UART
+            case (sys_reg[0])
+               1'b0:    sys_rdata = {24'b0, uart_rx_data};
+               1'b1:    sys_rdata = {29'b0, uart_baud_locked, uart_rx_valid, uart_tx_ready};
+            endcase
+         end
+         3'd1:    sys_rdata = bp_rdata;            // HW breakpoints
+         default: sys_rdata = 32'b0;
+      endcase
+   end
+
+   /*---------------------------------------------------------------*/
+   /* Top-level I/O read mux                                        */
+   /*---------------------------------------------------------------*/
+   reg  [31:0] io_rdata;
+   always @(*) begin
+      case (io_slot)
+         4'd0:    io_rdata = sys_rdata;           // System Control
+         default: io_rdata = 32'b0;               // slots 1–15: future
+      endcase
+   end
 
    /*---------------------------------------------------------------*/
    /* Read mux + handshake                                          */
    /*---------------------------------------------------------------*/
-   // ROM is combinational → no wait states for ROM fetches.
-   // RAM is synchronous → 1-cycle read latency handled by the core's
-   // existing S_FETCH_INSTR → S_WAIT_INSTR pipeline.
    assign mem_rdata = sel_rom ? rom_rdata :
                       sel_io  ? io_rdata  :
                                 ram_rdata ;
@@ -207,7 +284,6 @@ module attorv32_dbg #(
    reg [256*8-1:0] hex_file;
    integer i;
    initial begin
-      // Pre-zero all RAM (avoids x-propagation in uninitialized BSS).
       for (i = 0; i < RAM_WORDS; i = i + 1)
          ram[i] = 32'h00000000;
       if ($value$plusargs("hex=%s", hex_file))

@@ -41,7 +41,10 @@
 //                           for rs2 on branch/store/ALUreg)
 //   `NRV_SHARED_ADDER     : one shared 32-bit adder (requires SINGLE_PORT)
 //   `NRV_SERIAL_SHIFT     : 1-bit/cycle serial shifter (+shamt cycles)
-//   `NRV_SERIAL_MUL       : 32-cycle shift-add multiplier (requires NRV_M)
+//   `NRV_SERIAL_MUL       : serial shift-add multiplier (requires NRV_M)
+//                           Default: radix-2, 32 cycles.
+//   `NRV_RADIX4_MUL       : radix-4 modified Booth multiplier, 16 cycles
+//                           (requires NRV_SERIAL_MUL)
 //
 // Port summary:
 //   clk               : system clock
@@ -83,8 +86,11 @@ module AttoRV32 #(
    input                    interrupt_request,
    input                    nmi,             // non-maskable interrupt (edge-sensitive, level-held)
    input                    dbg_halt_req,    // debug halt request (active-high)
-   input                    reset        // active-low
+   input                    reset,       // active-low
+
+   output [ADDR_WIDTH-1:0]  pc_out           // current PC (for hardware breakpoints)
 );
+
 
    localparam NB_REGS  = RV32E ? 16 : 32;
    localparam REG_BITS = RV32E ? 4  : 5;
@@ -295,26 +301,125 @@ module AttoRV32 #(
 
 `ifdef NRV_SERIAL_MUL
    /*------------------------------------------------------------------*/
-   /* Serial 32-cycle shift-add multiplier.                            */
+   /* Serial shift-add multiplier.                                     */
    /* Operates on absolute values, with final negation for signed ops. */
    /* Area: saves ~15-20 kµm² vs 33x33 parallel multiplier on Sky130.  */
-   /* Cost: +32 cycles per MUL*. One extra cycle for final negate if   */
-   /*       signed operands differ in sign.                            */
+   /*                                                                  */
+   /*   NRV_RADIX4_MUL (define):                                       */
+   /*     OFF → radix-2:  32 cycles, 1-bit/cycle, minimal logic.       */
+   /*     ON  → radix-4 modified Booth: 16 cycles, 2-bits/cycle.       */
+   /*           One 33-bit adder/subtractor + Booth decode.            */
    /*------------------------------------------------------------------*/
    wire mul_sign1 = aluIn1[31] & (isMULH | isMULHSU);
    wire mul_sign2 = aluIn2[31] &  isMULH;
    wire [31:0] mul_abs1 = mul_sign1 ? -aluIn1 : aluIn1;
    wire [31:0] mul_abs2 = mul_sign2 ? -aluIn2 : aluIn2;
 
-   reg [63:0] mul_pm;      // {product[31:0], multiplier[31:0]}
+   reg [63:0] mul_pm;      // {partial_product, multiplier/result}
    reg [31:0] mul_mcand;   // multiplicand (abs value)
-   reg  [5:0] mul_count;   // counts 32 .. 0
+   reg  [5:0] mul_count;   // iteration counter
    reg        mul_neg;     // apply final negation if set
    reg        mul_negate_pending;
 
+`ifdef NRV_RADIX4_MUL
+   /*--- Radix-4 modified Booth: 16+1 cycles, 2 bits/iteration --------*/
+   /*                                                                  */
+   /* Textbook radix-4 Booth recoding on UNSIGNED absolute values.     */
+   /* We treat the partial product as a 33-bit signed accumulator      */
+   /* (bit 32 = sign from Booth subtract) and shift the 65-bit         */
+   /* {accumulator, multiplier} right by 2 each iteration.             */
+   /*                                                                  */
+   /*   {b1,b0,prev}  Action                                           */
+   /*     000, 111     +0   (skip)                                     */
+   /*     001, 010     +1×M                                            */
+   /*     011          +2×M                                            */
+   /*     100          −2×M                                            */
+   /*     101, 110     −1×M                                            */
+   /*                                                                  */
+   /* After 16 iterations (32 multiplier bits), a carry fixup cycle    */
+   /* handles the implicit 0 at bit 32.  If booth_prev is 1 after the  */
+   /* last iteration, the Booth digit {0,0,1} = +1×M must be added     */
+   /* to the accumulator.  Without this, unsigned multipliers with     */
+   /* bit 31 set produce results off by M × 2^32.                     */
+   /*                                                                  */
+   /* Total: 16 (Booth) + 1 (fixup) + 0-1 (negate) = 17-18 cycles.   */
+   /*------------------------------------------------------------------*/
+   reg        mul_booth_prev;    // previous LSB for Booth recoding
+   reg [32:0] mul_acc;           // 33-bit signed accumulator
+   reg        mul_fixup;         // carry correction cycle pending
+
+   wire [2:0] booth_bits = {mul_pm[1:0], mul_booth_prev};
+
+   wire booth_p1 = (booth_bits == 3'b001) | (booth_bits == 3'b010);
+   wire booth_p2 = (booth_bits == 3'b011);
+   wire booth_m2 = (booth_bits == 3'b100);
+   wire booth_m1 = (booth_bits == 3'b101) | (booth_bits == 3'b110);
+
+   // 33-bit add/subtract (signed accumulator ± unsigned multiplicand)
+   wire [32:0] booth_add1 = mul_acc + {1'b0, mul_mcand};
+   wire [32:0] booth_add2 = mul_acc + {mul_mcand, 1'b0};
+   wire [32:0] booth_sub1 = mul_acc - {1'b0, mul_mcand};
+   wire [32:0] booth_sub2 = mul_acc - {mul_mcand, 1'b0};
+
+   wire [32:0] booth_new_acc = booth_p1 ? booth_add1 :
+                                booth_p2 ? booth_add2 :
+                                booth_m1 ? booth_sub1 :
+                                booth_m2 ? booth_sub2 :
+                                           mul_acc;    // +0
+
+   // Arithmetic right-shift by 2: new_acc[32] is the sign bit
+   wire [32:0] booth_shifted_acc = {booth_new_acc[32], booth_new_acc[32],
+                                    booth_new_acc[32:2]};
+   wire [31:0] booth_shifted_lo  = {booth_new_acc[1:0], mul_pm[31:2]};
+
+   wire mul_busy = (|mul_count) | mul_fixup | mul_negate_pending;
+
+   always @(posedge clk) begin
+      if (!reset) begin
+         mul_count          <= 6'd0;
+         mul_negate_pending <= 1'b0;
+         mul_fixup          <= 1'b0;
+      end else if (aluWr & isMul) begin
+         mul_pm             <= {32'b0, mul_abs2};       // multiplier in low half
+         mul_acc            <= 33'b0;                    // accumulator starts at 0
+         mul_mcand          <= mul_abs1;
+         mul_count          <= 6'd16;
+         mul_neg            <= mul_sign1 ^ mul_sign2;
+         mul_negate_pending <= 1'b0;
+         mul_fixup          <= 1'b0;
+         mul_booth_prev     <= 1'b0;
+      end else if (|mul_count) begin
+         mul_acc        <= booth_shifted_acc;
+         mul_pm         <= {booth_shifted_acc[31:0], booth_shifted_lo};
+         mul_booth_prev <= mul_pm[1];
+         mul_count      <= mul_count - 6'd1;
+         if (mul_count == 6'd1) mul_fixup <= 1'b1;
+      end else if (mul_fixup) begin
+         /* Carry correction: Booth recoding of an N-bit unsigned value    */
+         /* needs an implicit 0 at bit N.  If booth_prev is 1, the final  */
+         /* Booth digit is {0,0,1} = +1×M, so add M to the accumulator    */
+         /* (equivalent to adding M × 2^32 to the 64-bit product).        */
+         /* Also sync mul_pm[63:32] so mul_hi reads the correct value.    */
+         if (mul_booth_prev) begin
+            mul_acc <= mul_acc + {1'b0, mul_mcand};
+            mul_pm  <= {mul_acc[31:0] + mul_mcand, mul_pm[31:0]};
+         end else begin
+            mul_pm  <= {mul_acc[31:0], mul_pm[31:0]};
+         end
+         mul_fixup          <= 1'b0;
+         mul_negate_pending <= mul_neg;
+      end else if (mul_negate_pending) begin
+         mul_pm             <= -{mul_acc[31:0], mul_pm[31:0]};
+         mul_negate_pending <= 1'b0;
+      end
+   end
+
+`else
+   /*--- Radix-2: 32 cycles, 1 bit/iteration, minimal logic -----------*/
    wire [32:0] mul_add = {1'b0, mul_pm[63:32]} + {1'b0, mul_mcand};
    wire [32:0] mul_new_upper = mul_pm[0] ? mul_add : {1'b0, mul_pm[63:32]};
-   wire        mul_busy = (|mul_count) | mul_negate_pending;
+
+   wire mul_busy = (|mul_count) | mul_negate_pending;
 
    always @(posedge clk) begin
       if (!reset) begin
@@ -335,6 +440,7 @@ module AttoRV32 #(
          mul_negate_pending <= 1'b0;
       end
    end
+`endif
 
    wire [31:0] mul_lo = mul_pm[31:0];
    wire [31:0] mul_hi = mul_pm[63:32];
@@ -438,6 +544,7 @@ module AttoRV32 #(
    /***************************************************************************/
 
    reg  [ADDR_WIDTH-1:0] PC;
+   assign pc_out = PC;
    reg  [31:2]           instr;
 
    wire [ADDR_WIDTH-1:0] PCplus2 = PC + 2;
@@ -496,15 +603,32 @@ module AttoRV32 #(
 
 `ifdef NRV_PERF_CSR
    reg [63:0] cycles;
+   reg [63:0] instret;
    always @(posedge clk) cycles <= cycles + 1;
+
+   /* Instruction retirement: fires once per completed instruction.       */
+   /*   - Single-cycle instrs complete in S_EXECUTE (when !needToWait).   */
+   /*   - Multi-cycle instrs (load/store/div/serial-shift/serial-mul)     */
+   /*     complete when S_WAIT finishes.                                  */
+   /*   - Traps in S_EXECUTE count as retired (RISC-V convention).        */
+   wire instr_retired =
+        (state == S_EXECUTE && !needToWait)                          |
+        (state == S_EXECUTE && needToWait && trap_entry)             |
+        (state == S_WAIT    && !aluBusy && !mem_rbusy && !mem_wbusy) ;
+   always @(posedge clk) begin
+      if (!reset) instret <= 64'd0;
+      else if (instr_retired) instret <= instret + 64'd1;
+   end
 `endif
 
-   wire sel_mstatus = (instr[31:20] == 12'h300);
-   wire sel_mepc    = (instr[31:20] == 12'h341);
-   wire sel_mcause  = (instr[31:20] == 12'h342);
+   wire sel_mstatus  = (instr[31:20] == 12'h300);
+   wire sel_mepc     = (instr[31:20] == 12'h341);
+   wire sel_mcause   = (instr[31:20] == 12'h342);
 `ifdef NRV_PERF_CSR
-   wire sel_cycles  = (instr[31:20] == 12'hC00);
-   wire sel_cyclesh = (instr[31:20] == 12'hC80);
+   wire sel_cycles   = (instr[31:20] == 12'hC00);
+   wire sel_cyclesh  = (instr[31:20] == 12'hC80);
+   wire sel_instret  = (instr[31:20] == 12'hC02);
+   wire sel_instreth = (instr[31:20] == 12'hC82);
 `endif
 
    // mcause read: RV-standard format.
@@ -529,8 +653,10 @@ module AttoRV32 #(
      (sel_mcause  ? mcause_read                  : 32'b0)
 `ifdef NRV_PERF_CSR
      |
-     (sel_cycles  ? cycles[31:0]                 : 32'b0) |
-     (sel_cyclesh ? cycles[63:32]                : 32'b0)
+     (sel_cycles   ? cycles[31:0]                 : 32'b0) |
+     (sel_cyclesh  ? cycles[63:32]                : 32'b0) |
+     (sel_instret  ? instret[31:0]               : 32'b0) |
+     (sel_instreth ? instret[63:32]              : 32'b0)
 `endif
      ;
    /* verilator lint_on WIDTH */
@@ -801,7 +927,8 @@ module AttoRV32 #(
    integer i;
    initial begin
 `ifdef NRV_PERF_CSR
-      cycles = 0;
+      cycles  = 0;
+      instret = 0;
 `endif
       for (i = 0; i < NB_REGS; i = i + 1) registerFile[i] = 0;
    end

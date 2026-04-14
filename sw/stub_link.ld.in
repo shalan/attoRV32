@@ -4,19 +4,18 @@
  *   @RAM_SIZE@    : RAM region size in bytes     (e.g. 4096)
  *   @ROM_BASE@    : ROM byte base address        (e.g. 0x1000)
  *   @ROM_SIZE@    : ROM region size in bytes      (e.g. 4096)
- *   @IO_BASE@     : I/O region start             (e.g. 0x0FF0)
+ *   @IO_BASE@     : I/O region start             (e.g. 0x2000)
  *   @STUB_DATA@   : start of stub mutable data   (e.g. 0x0D70)
  *
- * Layout (ADDR_WIDTH = RAM_AW + 1):
- *   RAM : 0x0000 – (IO_BASE - 1)         user code + data + stack
- *         STUB_DATA – (IO_BASE - 1)       stub mutable data (g_regs[], BPs, etc.)
- *   IO  : IO_BASE – (IO_BASE + 15)       UART + control registers
- *   ROM : ROM_BASE – (ROM_BASE + ROM_SIZE - 1)  stub code
+ * Layout:
+ *   RAM : 0x0000 – (RAM_SIZE - 1)        user code + data + stack
+ *         STUB_DATA – (RAM_SIZE - 1)      stub mutable data (g_regs[], BPs, etc.)
+ *   ROM : ROM_BASE – (ROM_BASE + ROM_SIZE - 1)  stub code (combinational)
+ *   IO  : IO_BASE – (IO_BASE + 0xFFF)    16 peripheral slots × 256 bytes
  *
  * .text and .rodata are placed in ROM (read-only, combinational logic).
- * .data and .bss are placed in a reserved block at the top of RAM,
- * just below the IO region.  The user firmware's linker script must
- * end its stack/heap before STUB_DATA:
+ * .data and .bss are placed in a reserved block at the top of RAM.
+ * The user firmware's linker script must end its stack/heap before STUB_DATA:
  *     __stack_top = @STUB_DATA@;
  */
 
@@ -28,7 +27,7 @@ MEMORY {
      * We use 0x4 to avoid colliding with the reset-vector jump at 0x0. */
     LOW_RAM  (rw)  : ORIGIN = 0x00000004,  LENGTH = 4
     ROM      (rx)  : ORIGIN = @ROM_BASE@,  LENGTH = @ROM_SIZE@
-    STUB_RAM (rw)  : ORIGIN = @STUB_DATA@, LENGTH = @IO_BASE@ - @STUB_DATA@
+    STUB_RAM (rw)  : ORIGIN = @STUB_DATA@, LENGTH = @RAM_SIZE@ - @STUB_DATA@
 }
 
 SECTIONS {
@@ -72,9 +71,9 @@ SECTIONS {
         __stub_bss_end = .;
     } > STUB_RAM
 
-    /* Verify stub data doesn't overflow into IO. */
-    ASSERT(__stub_bss_end <= @IO_BASE@,
-           "Stub .data + .bss overflow into I/O region!")
+    /* Verify stub data doesn't overflow past RAM. */
+    ASSERT(__stub_bss_end <= @RAM_SIZE@,
+           "Stub .data + .bss overflow past RAM!")
 
     /* Symbol for the ROM entry point (used by MTVEC_ADDR parameter). */
     __rom_base = @ROM_BASE@;

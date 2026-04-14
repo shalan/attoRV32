@@ -18,7 +18,7 @@ mkdir -p "$BUILD"
 
 RAM_AW=12
 RAM_SIZE=$((1 << RAM_AW))
-IO_BASE=$((RAM_SIZE - 16))
+IO_BASE=0x2000
 
 echo "=== Debug Facility Test ==="
 echo
@@ -27,7 +27,7 @@ echo
 echo "--- Building test firmware ---"
 cat > "$BUILD/dbg_test.ld" << LDEOF
 MEMORY {
-    RAM (rwx) : ORIGIN = 0x00000000, LENGTH = 0x0BF0
+    RAM (rwx) : ORIGIN = 0x00000000, LENGTH = 0x1000
 }
 ENTRY(_start)
 SECTIONS {
@@ -37,7 +37,7 @@ SECTIONS {
     } > RAM
     .data : { *(.data .data.*) } > RAM
     .bss (NOLOAD) : { *(.bss .bss.*) } > RAM
-    __stack_top = 0x0BF0;
+    __stack_top = 0x1000;
 }
 LDEOF
 
@@ -75,7 +75,7 @@ echo
 echo "--- Compiling testbench ---"
 $IVERILOG -g2005-sv -DBENCH \
     -o "$BUILD/tb_dbg.vvp" \
-    sim/tb_dbg.v rtl/attorv32.v rtl/attorv32_dbg.v rtl/stub_rom.v
+    sim/tb_dbg.v rtl/attorv32.v rtl/attorv32_dbg.v rtl/hw_bkpt.v rtl/stub_rom.v
 
 # 4) Run simulation.
 echo "--- Running simulation ---"

@@ -28,12 +28,15 @@ AttoRV32/
 ├── rtl/           Verilog source
 │   ├── attorv32.v             # the core (+ decompressor)
 │   ├── attorv32_ahbl.v        # AHB-Lite master wrapper
-│   ├── attorv32_dbg.v         # debug SoC (core + RAM + stub ROM + UART)
-│   └── stub_rom.v             # combinational ROM for GDB stub
+│   ├── attorv32_dbg.v         # debug SoC (core + RAM + stub ROM + UART + bkpt)
+│   ├── dbg_uart.v             # debug UART (auto-baud 0x55, 8N1, break detect)
+│   ├── hw_bkpt.v              # hardware breakpoint unit (4 PC comparators)
+│   └── stub_rom.v             # combinational ROM for GDB stub (auto-generated)
 ├── sim/           Simulation
 │   ├── tb.v                   # self-checking testbench
 │   ├── run_tb.sh              # build firmware + run iverilog sweep
 │   ├── tb_dbg.v               # debug facility testbench (iverilog)
+│   ├── tb_dbg_uart.v          # debug UART testbench (auto-baud, TX/RX, break)
 │   ├── run_dbg_tb.sh          # build debug firmware + run tb_dbg.v
 │   ├── tb_dbg_gdb.cpp         # Verilator GDB bridge (TCP ↔ UART)
 │   ├── build_gdb_bridge.sh    # build the Verilator GDB bridge
@@ -45,6 +48,8 @@ AttoRV32/
 │   ├── link.ld.in             # linker template (RAM size substituted)
 │   ├── main.c                 # minimal blinker example
 │   ├── selftest.c             # self-checking firmware (used by tb)
+│   ├── bench_compute.c        # matmul + TEA benchmark (CPI measurement)
+│   ├── bench_sort.c           # insertion + bubble sort benchmark
 │   ├── gdb_stub.h             # GDB RSP stub header
 │   ├── gdb_stub.c             # GDB RSP stub (~600 lines, full implementation)
 │   ├── crt0_stub.S            # ISR entry: save regs → g_regs[], call stub, restore, mret
@@ -55,6 +60,11 @@ AttoRV32/
 │   ├── syn.tcl                # Yosys flow (timing-driven ABC)
 │   ├── sta.tcl                # OpenSTA WNS measurement
 │   ├── abc_timing.script      # ABC mapping template ({D} = period ps)
+│   ├── abc_area.script        # ABC area-optimized recipe
+│   ├── abc_delay.script       # ABC delay-optimized recipe
+│   ├── abc_resyn2.script      # ABC resyn2 recipe
+│   ├── abc_default.script     # ABC default recipe (best area overall)
+│   ├── compare_emc.sh         # RV32EMC config × ABC recipe comparison
 │   └── summarize.py           # cell-count / area report builder
 ├── scripts/       Build helpers
 │   └── gen_stub_rom.py        # compile stub → Verilog ROM
@@ -95,11 +105,12 @@ bash syn/run_syn.sh
 | C (compressed) extension | Always on |
 | M (mul/div/rem) extension | `` `define NRV_M `` |
 | SRA / SRAI | `` `define NRV_SRA `` |
-| Performance CSRs (`rdcycle`, `rdcycleh`) | `` `define NRV_PERF_CSR `` |
+| Performance CSRs (`rdcycle`, `rdinstret` + high halves) | `` `define NRV_PERF_CSR `` |
 | Single-port register file | `` `define NRV_SINGLE_PORT_REGF `` |
 | Shared ALU/PC/LSU adder | `` `define NRV_SHARED_ADDER `` |
 | Serial 1-bit/cycle shifter | `` `define NRV_SERIAL_SHIFT `` |
 | Serial 32-cycle shift-add multiplier | `` `define NRV_SERIAL_MUL `` |
+| Radix-4 modified Booth multiplier (17 cycles) | `` `define NRV_RADIX4_MUL `` |
 | External interrupt (maskable, non-sticky) | Always on |
 | NMI (non-maskable interrupt) | Always on |
 | Debug halt (bypasses MIE + mcause) | Always on |
@@ -128,11 +139,12 @@ bash syn/run_syn.sh
 |---|---|
 | `NRV_M` | Enable M extension (MUL/DIV/REM/MULH*) |
 | `NRV_SRA` | Enable arithmetic right shift (SRA/SRAI) |
-| `NRV_PERF_CSR` | Enable 64-bit cycle counter (`rdcycle` / `rdcycleh`) |
+| `NRV_PERF_CSR` | 64-bit cycle + instruction-retired counters |
 | `NRV_SINGLE_PORT_REGF` | Single-read-port regfile (extra cycle for rs2) |
 | `NRV_SHARED_ADDER` | One shared 32-bit adder (requires `SINGLE_PORT`) |
 | `NRV_SERIAL_SHIFT` | 1-bit/cycle serial shifter (+shamt cycles) |
 | `NRV_SERIAL_MUL` | 32-cycle shift-add multiplier (requires `NRV_M`) |
+| `NRV_RADIX4_MUL` | Radix-4 modified Booth: 17-cycle multiply (requires `NRV_SERIAL_MUL`) |
 
 ---
 
@@ -173,8 +185,10 @@ All traps vector to `MTVEC_ADDR`. The ISR reads `mcause` to dispatch.
 | `mstatus` | `0x300` | RW | Bit 3 = MIE (machine interrupt enable) |
 | `mepc` | `0x341` | RW | Exception program counter |
 | `mcause` | `0x342` | RO | Trap cause (RV-standard format) |
-| `rdcycle` | `0xC00` | RO | Cycle counter low (requires `NRV_PERF_CSR`) |
-| `rdcycleh` | `0xC80` | RO | Cycle counter high (requires `NRV_PERF_CSR`) |
+| `mcycle` | `0xC00` | RO | Cycle counter low (requires `NRV_PERF_CSR`) |
+| `mcycleh` | `0xC80` | RO | Cycle counter high (requires `NRV_PERF_CSR`) |
+| `minstret` | `0xC02` | RO | Instructions-retired counter low (requires `NRV_PERF_CSR`) |
+| `minstreth` | `0xC82` | RO | Instructions-retired counter high (requires `NRV_PERF_CSR`) |
 
 ---
 
@@ -233,19 +247,33 @@ Single-beat AHB-Lite master. Translates the native `mem_*` handshake into
 
 Reference integration for GDB debugging. Instantiates:
 
-- **AttoRV32** core (`MTVEC_ADDR` = ROM base)
-- **RAM** (behavioural, byte-writable)
+- **AttoRV32** core (`MTVEC_ADDR` = ROM base, `pc_out` for breakpoints)
+- **RAM** (synchronous read/write, maps to real SRAM)
 - **Combinational stub ROM** (`rtl/stub_rom.v`) — GDB RSP code in LUT logic
-- **UART I/O registers** (TX data, RX data, status)
-- **UART break detector** → `dbg_halt_req` (4-bit saturating counter on RX)
+- **Debug UART** (`rtl/dbg_uart.v`) — auto-baud (0x55), 8N1, break detection
+- **Hardware breakpoints** (`rtl/hw_bkpt.v`) — 4 PC-match comparators
+- **UART break detector** → `dbg_halt_req` (4-bit counter in sim, 12-bit-period in synthesis)
 
-Memory map (with `RAM_AW=12`, total `ADDR_WIDTH=13`):
+Memory map (with `RAM_AW=12`, `ADDR_WIDTH=14`):
 
 ```
-0x0000 – 0x0FEF : RAM  (4080 bytes)
-0x0FF0 – 0x0FFF : I/O  (UART + control, 16 bytes)
-0x1000 – 0x1FFF : stub ROM  (combinational, traps land here)
+0x0000 – 0x0FFF : RAM  (4 KiB)
+0x1000 – 0x1FFF : stub ROM  (4 KiB, combinational, traps land here)
+0x2000 – 0x2FFF : I/O  (16 peripheral slots × 256 bytes)
 ```
+
+I/O slot 0 (0x2000) — System Control (8 sub-slots × 32 bytes):
+
+| Sub-slot | Address | Block |
+|---|---|---|
+| 0 | `0x2000` | UART (DATA, STATUS) |
+| 1 | `0x2020` | HW breakpoints (CTRL, HIT, COUNT, ADDR[0–3]) |
+| 2 | `0x2040` | System Timer (TBD) |
+| 3 | `0x2060` | PIC (TBD) |
+| 4 | `0x2080` | Clocking (TBD) |
+| 5 | `0x20A0` | Control ($finish in sim) |
+
+Slots 1–15 (0x2100–0x2FFF) available for user peripherals.
 
 ---
 
@@ -254,17 +282,17 @@ Memory map (with `RAM_AW=12`, total `ADDR_WIDTH=13`):
 See [`docs/debug.md`](docs/debug.md) for the full specification.
 
 **Summary:** GDB connects over UART using the Remote Serial Protocol (RSP).
-A ~2.5 KiB stub compiled into a combinational ROM handles all debug
-operations — halt, continue, single-step, breakpoints, register/memory
-read/write — with **zero changes to the core**. The UART break detector
-drives `dbg_halt_req` for async halt (GDB Ctrl-C).
+A ~2.7 KiB stub compiled into a combinational ROM handles all debug
+operations — halt, continue, single-step, software + hardware breakpoints,
+register/memory read/write. The core adds one output port (`pc_out`) and
+one FF (`dbg_halt_mask`).
 
 | Resource | Cost |
 |---|---|
-| Core modifications | 1 FF (`dbg_halt_mask` prevents re-triggering) |
-| Stub ROM | ~2,300 cells / 13,044 µm² (Sky130, combinational) |
-| UART | ~100–200 cells (polled, minimal) |
-| UART break detector | 4 FFs + a few gates |
+| Core modifications | 1 output port (`pc_out`), 1 FF (`dbg_halt_mask`) |
+| Stub ROM | ~2,300 cells (Sky130, combinational) |
+| Debug UART (auto-baud + break) | ~200 cells |
+| HW breakpoint unit (4 slots) | ~300 cells |
 | RAM overhead | ~800 bytes (register frame + BP table + packet buffer + stack) |
 
 **Verified GDB operations:**
@@ -274,14 +302,14 @@ drives `dbg_halt_req` for async halt (GDB Ctrl-C).
 | Connect + halt | UART break on TCP connect → `T05` stop-reply |
 | Register read/write | `info registers`, `set $pc = ...` |
 | Memory read/write | `x/...`, `set {int}addr = ...` |
-| Software breakpoints | `break *addr` → `ebreak` / `c.ebreak` overwrite |
+| Software breakpoints | `break *addr` → `ebreak` / `c.ebreak` overwrite (RAM only) |
+| Hardware breakpoints | `hbreak *addr` → hw_bkpt PC comparator (ROM/flash too) |
 | Continue | `continue` → `mret` → user code runs |
 | Single-step | `stepi` → next-PC prediction + scratch breakpoints |
 | Async halt (Ctrl-C) | GDB sends 0x03 → bridge drives UART break → `dbg_halt_req` |
 
-See [`docs/debug.md`](docs/debug.md) §7 for the full workflow
-(build instructions, GDB example session, plusargs) and §8 for
-constraints and known limitations.
+See [`docs/debug.md`](docs/debug.md) for the full specification,
+build workflow, GDB example session, and known limitations.
 
 ---
 
@@ -307,7 +335,8 @@ FETCH_INSTR → WAIT_INSTR → [FETCH_RS2] → EXECUTE → (WAIT | WAIT_INSTR | 
 | Shift (barrel) | 3 |
 | Shift (serial) | 3 + shamt |
 | Multiply (parallel) | 3 |
-| Multiply (serial) | 3 + 32–33 |
+| Multiply (serial, radix-2) | 3 + 32–33 |
+| Multiply (serial, radix-4 Booth) | 3 + 17–18 |
 | Divide / Remainder | 3 + 32 |
 | Trap entry | 1 |
 
@@ -365,7 +394,51 @@ riscv64-elf-gdb build/dbg_test/dbg_test.elf \
 
 ---
 
-## 10. Credits
+## 10. Benchmarks
+
+CPI (Cycles Per Instruction) measured on **Config B**: RV32EMC, serial mul,
+parallel shift, single-port regfile, shared adder, SRA (`NRV_M NRV_SRA
+NRV_SINGLE_PORT_REGF NRV_SHARED_ADDER NRV_SERIAL_MUL`). RV32E=1, AW=12.
+IRQs disabled during measurement.  Requires `NRV_PERF_CSR` for
+`mcycle`/`minstret` counters.
+
+### Radix-2 (32-cycle serial mul) vs Radix-4 Booth (17-cycle mul)
+
+| Benchmark | Instructions | R2 Cycles | R2 CPI | R4 Cycles | R4 CPI | Speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| 4×4 matmul ×10 | 6,673 | 45,170 | 6.77 | 35,570 | 5.33 | 1.27× |
+| TEA encrypt ×16 blocks | 9,796 | 35,523 | 3.63 | 35,523 | 3.63 | — |
+| Insertion sort 32×5 | 11,199 | 43,372 | 3.87 | 43,372 | 3.87 | — |
+| Bubble sort 32×5 | 20,869 | 77,177 | 3.70 | 77,177 | 3.70 | — |
+
+**Observations:**
+
+- **Baseline CPI ≈ 3.7** reflects multi-cycle overhead: single-port regfile
+  (+1 cycle for rs2), shared adder, and multi-cycle loads/stores.
+- **Matmul CPI = 5.33** (R4) is highest due to multiply-heavy inner loop;
+  radix-4 Booth cuts 9,600 cycles (1.27× speedup) vs radix-2.
+- **TEA/sort** have no MUL instructions — identical on both multipliers.
+- **Radix-4 Booth area cost:** +466 cells / +4,800 µm² (~9%) on Sky130 HD.
+
+Build and run:
+
+```bash
+# Build benchmarks
+make -C sw clean && make -C sw BENCH_COMPUTE=1 ADDR_WIDTH=12 RV32E=1 HAVE_M=1
+make -C sw clean && make -C sw BENCH_SORT=1    ADDR_WIDTH=12 RV32E=1 HAVE_M=1
+
+# Simulate (add NRV_PERF_CSR for cycle/instret counters)
+iverilog -g2005-sv -DBENCH -DNRV_M -DNRV_SRA -DNRV_SINGLE_PORT_REGF \
+    -DNRV_SHARED_ADDER -DNRV_SERIAL_MUL -DNRV_RADIX4_MUL -DNRV_PERF_CSR \
+    -Ptb.ADDR_WIDTH=12 -Ptb.RV32E=1 \
+    -o build/sim/bench.vvp sim/tb.v rtl/attorv32.v
+vvp build/sim/bench.vvp +hex=sw/bench_compute.hex +timeout=2000000
+vvp build/sim/bench.vvp +hex=sw/bench_sort.hex    +timeout=2000000
+```
+
+---
+
+## 11. Credits
 
 - **FemtoRV32** and **Gracilis** core design: Bruno Levy, Matthias Koch
   (2020–2021). https://github.com/BrunoLevy/learn-fpga

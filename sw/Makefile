@@ -67,9 +67,18 @@ ASFLAGS = $(CFLAGS)
 # ---- Sources --------------------------------------------------------------
 # Build with SELFTEST=1 to link selftest.c instead of main.c. Selftest also
 # receives HAVE_M (for compile-time gating of M-extension tests).
-SELFTEST ?= 0
+# BENCH_COMPUTE=1 or BENCH_SORT=1 builds the corresponding benchmark.
+SELFTEST      ?= 0
+BENCH_COMPUTE ?= 0
+BENCH_SORT    ?= 0
 
-ifeq ($(SELFTEST),1)
+ifeq ($(BENCH_COMPUTE),1)
+  SRCS_C := bench_compute.c isr.c
+  TARGET := bench_compute
+else ifeq ($(BENCH_SORT),1)
+  SRCS_C := bench_sort.c isr.c
+  TARGET := bench_sort
+else ifeq ($(SELFTEST),1)
   SRCS_C := selftest.c isr.c
   TARGET := selftest
   CFLAGS += -DHAVE_IRQ
@@ -121,7 +130,9 @@ $(TARGET).lst: $(TARGET).elf
 
 clean:
 	rm -f *.o firmware.elf firmware.hex firmware.bin firmware.lst \
-	      selftest.elf selftest.hex selftest.bin selftest.lst link.ld
+	      selftest.elf selftest.hex selftest.bin selftest.lst \
+	      bench_compute.elf bench_compute.hex bench_compute.bin bench_compute.lst \
+	      bench_sort.elf bench_sort.hex bench_sort.bin bench_sort.lst link.ld
 
 # ---- Sanity check: no AUIPC in output (optional)  -------------------------
 check-noauipc: $(TARGET).lst

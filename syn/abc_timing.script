@@ -9,3 +9,4 @@ stime -c
 upsize {D} -c
 dnsize {D} -c
 stime -p
+print_stats -m

@@ -40,7 +40,7 @@ verilator --cc --exe \
     --top-module attorv32_dbg \
     --Mdir "$BUILD/obj_dir" \
     -o Vattorv32_dbg \
-    rtl/attorv32.v rtl/attorv32_dbg.v rtl/stub_rom.v \
+    rtl/attorv32.v rtl/attorv32_dbg.v rtl/hw_bkpt.v rtl/stub_rom.v \
     sim/tb_dbg_gdb.cpp
 
 echo "--- Compiling ---"

@@ -11,7 +11,9 @@ PDK="${PDK:-/Users/mshalan/work/pdks/volare/sky130/versions/0fe599b2afb6708d2815
 export LIB="${LIB:-$PDK/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib}"
 export SRC="rtl/attorv32.v"
 export TOP="AttoRV32"
-export ABC_SCRIPT="syn/abc_timing.script"
+# ABC recipe: override via ABC_SCRIPT env or --abc flag.
+# Available: abc_timing.script (default), abc_area.script, abc_delay.script, abc_resyn2.script
+export ABC_SCRIPT="${ABC_SCRIPT:-syn/abc_timing.script}"
 export BUILD_DIR="build/syn"
 export LOG_DIR="build/logs"
 

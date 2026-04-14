@@ -64,7 +64,7 @@ def prepare_linker_script(tmpdir, rom_base, rom_size, ram_size, io_base,
     with open(ld_in) as f:
         txt = f.read()
 
-    stub_data = io_base - stub_reserve
+    stub_data = ram_size - stub_reserve
 
     txt = txt.replace('@RAM_SIZE@',  f'0x{ram_size:08X}')
     txt = txt.replace('@ROM_BASE@',  f'0x{rom_base:08X}')
@@ -226,7 +226,7 @@ def main():
     ram_size  = 1 << args.ram_aw
     rom_base  = args.rom_base if args.rom_base is not None else ram_size
     rom_size  = ram_size            # ROM half = RAM half
-    io_base   = ram_size - 16      # last 16 bytes of RAM half = I/O
+    io_base   = 0x2000             # I/O page at 0x2000 (16 slots × 256 B)
 
     arch = 'rv32ec_zicsr' if args.rv32e else 'rv32ic_zicsr'
     abi  = 'ilp32e'       if args.rv32e else 'ilp32'
