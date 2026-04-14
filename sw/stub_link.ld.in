@@ -1,0 +1,82 @@
+/* stub_link.ld.in — Linker script for ROM-resident GDB stub.
+ *
+ * Substitutions (by gen_stub_rom.py):
+ *   @RAM_SIZE@    : RAM region size in bytes     (e.g. 4096)
+ *   @ROM_BASE@    : ROM byte base address        (e.g. 0x1000)
+ *   @ROM_SIZE@    : ROM region size in bytes      (e.g. 4096)
+ *   @IO_BASE@     : I/O region start             (e.g. 0x0FF0)
+ *   @STUB_DATA@   : start of stub mutable data   (e.g. 0x0D70)
+ *
+ * Layout (ADDR_WIDTH = RAM_AW + 1):
+ *   RAM : 0x0000 – (IO_BASE - 1)         user code + data + stack
+ *         STUB_DATA – (IO_BASE - 1)       stub mutable data (g_regs[], BPs, etc.)
+ *   IO  : IO_BASE – (IO_BASE + 15)       UART + control registers
+ *   ROM : ROM_BASE – (ROM_BASE + ROM_SIZE - 1)  stub code
+ *
+ * .text and .rodata are placed in ROM (read-only, combinational logic).
+ * .data and .bss are placed in a reserved block at the top of RAM,
+ * just below the IO region.  The user firmware's linker script must
+ * end its stack/heap before STUB_DATA:
+ *     __stack_top = @STUB_DATA@;
+ */
+
+ENTRY(_isr_entry)
+
+MEMORY {
+    /* 4 bytes at a low address for __sp_save (zero-base sw/lw trick).
+     * Address must be < 0x800 so %lo() produces a positive signed imm12.
+     * We use 0x4 to avoid colliding with the reset-vector jump at 0x0. */
+    LOW_RAM  (rw)  : ORIGIN = 0x00000004,  LENGTH = 4
+    ROM      (rx)  : ORIGIN = @ROM_BASE@,  LENGTH = @ROM_SIZE@
+    STUB_RAM (rw)  : ORIGIN = @STUB_DATA@, LENGTH = @IO_BASE@ - @STUB_DATA@
+}
+
+SECTIONS {
+    /* ---- LOW RAM (zero-base addressable scratch) -------------------- */
+    /* __sp_save must be at addr < 0x800 for the sw/lw zero-base trick
+     * in crt0_stub.S.  4 bytes at 0x4 (after the reset-vector jump).  */
+    .sp_scratch 0x4 (NOLOAD) : {
+        *(.sp_scratch)
+    } > LOW_RAM
+
+    /* ---- ROM --------------------------------------------------------- */
+    /* _isr_entry (trap vector) must be at ROM_BASE exactly so that
+     * MTVEC_ADDR = ROM_BASE in the hardware.                            */
+    .isr @ROM_BASE@ : {
+        *(.isr .isr.*)          /* ISR entry from crt0_stub.S (first) */
+    } > ROM
+
+    .text : {
+        *(.text .text.*)
+    } > ROM
+
+    .rodata : {
+        *(.rodata .rodata.*)
+    } > ROM
+
+    __rom_end = .;
+
+    /* ---- RAM (stub's own mutable data) ------------------------------- */
+    /* Placed at STUB_DATA, which is IO_BASE - STUB_RESERVE.
+     * User firmware must not use addresses >= STUB_DATA.                */
+
+    .data : {
+        __stub_data_start = .;
+        *(.data .data.* .sdata .sdata.*)
+        __stub_data_end = .;
+    } > STUB_RAM
+
+    .bss (NOLOAD) : {
+        __stub_bss_start = .;
+        *(.bss .bss.* .sbss .sbss.* COMMON)
+        __stub_bss_end = .;
+    } > STUB_RAM
+
+    /* Verify stub data doesn't overflow into IO. */
+    ASSERT(__stub_bss_end <= @IO_BASE@,
+           "Stub .data + .bss overflow into I/O region!")
+
+    /* Symbol for the ROM entry point (used by MTVEC_ADDR parameter). */
+    __rom_base = @ROM_BASE@;
+    __io_base  = @IO_BASE@;
+}

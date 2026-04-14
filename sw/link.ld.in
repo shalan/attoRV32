@@ -1,0 +1,63 @@
+/* link.ld.in — AttoRV32 linker template.
+ * @RAM_SIZE@ is substituted by the Makefile (in bytes).
+ * MTVEC_ADDR must match the Verilog parameter (default 0x10).
+ */
+
+OUTPUT_ARCH(riscv)
+ENTRY(_reset)
+
+MEMORY
+{
+    RAM (rwx) : ORIGIN = 0x00000000, LENGTH = @RAM_SIZE@
+}
+
+SECTIONS
+{
+    /* 0x0000 : reset trampoline. Must be <= 0x10 bytes. */
+    .reset 0x00000000 : {
+        KEEP(*(.reset))
+        . = 0x10;
+    } > RAM
+
+    /* 0x0010 : interrupt entry point (matches MTVEC_ADDR in hardware). */
+    .isr 0x00000010 : {
+        KEEP(*(.isr))
+    } > RAM
+
+    /* Real startup + user code. */
+    .text : ALIGN(4) {
+        KEEP(*(.text.init))
+        *(.text .text.*)
+    } > RAM
+
+    .rodata : ALIGN(4) {
+        *(.rodata .rodata.*)
+        *(.srodata .srodata.*)
+    } > RAM
+
+    .data : ALIGN(4) {
+        __data_start = .;
+        *(.data .data.*)
+        *(.sdata .sdata.*)
+        __data_end = .;
+    } > RAM
+
+    .bss : ALIGN(4) {
+        __bss_start = .;
+        *(.bss .bss.*)
+        *(.sbss .sbss.*)
+        *(COMMON)
+        . = ALIGN(4);
+        __bss_end = .;
+    } > RAM
+
+    /* The top 16 bytes of RAM are reserved by the testbench for memory-
+     * mapped I/O (DONE / DEBUG / IRQ_STATUS / IRQ_CLEAR). The stack must
+     * start *below* that region so the ISR's register-save stores never
+     * spill into the I/O range. */
+    __io_base   = ORIGIN(RAM) + LENGTH(RAM) - 16;
+    __stack_top = __io_base;
+    __ram_end   = ORIGIN(RAM) + LENGTH(RAM);
+
+    /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.riscv.attributes) }
+}

@@ -1,0 +1,11 @@
+strash
+dch -f
+map -D {D} -B 0.2 -A 0.9
+topo
+stime -c
+buffer -c
+topo
+stime -c
+upsize {D} -c
+dnsize {D} -c
+stime -p

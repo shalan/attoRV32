@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+logs/
+sim/*.vvp
+sim/*.vcd
+
+# Firmware build intermediates
+sw/*.o
+sw/*.elf
+sw/*.bin
+sw/*.hex
+sw/*.lst
+sw/link.ld
+
+# Python / misc
+__pycache__/
+*.pyc
+.DS_Store
+
+# Claude Code
+.claude/
