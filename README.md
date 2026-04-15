@@ -14,8 +14,10 @@ cores. Not a performance part.
 > [FemtoRV32 "Gracilis"](https://github.com/BrunoLevy/learn-fpga/tree/master/FemtoRV)
 > core, then was stripped down, re-parameterized, and re-plumbed for small-ASIC
 > flows: hardcoded `mtvec`, non-sticky external IRQ, NMI, debug halt input,
-> optional serial shifter / serial multiplier / single-port register file /
-> shared adder, and a timing-driven Sky130A synthesis + self-checking testbench.
+> optional serial shifter / serial multiplier (radix-2 or radix-4 Booth) /
+> single-port register file / shared adder, performance counters
+> (`mcycle` + `minstret`), a GDB-over-UART debug facility, and a
+> timing-driven Sky130A synthesis + self-checking testbench.
 > Huge thanks to the original FemtoRV32 authors — without their work this core
 > would not exist.
 
@@ -64,12 +66,14 @@ AttoRV32/
 │   ├── abc_delay.script       # ABC delay-optimized recipe
 │   ├── abc_resyn2.script      # ABC resyn2 recipe
 │   ├── abc_default.script     # ABC default recipe (best area overall)
+│   ├── compare_abc.sh         # ABC recipe comparison on a single config
 │   ├── compare_emc.sh         # RV32EMC config × ABC recipe comparison
 │   └── summarize.py           # cell-count / area report builder
 ├── scripts/       Build helpers
 │   └── gen_stub_rom.py        # compile stub → Verilog ROM
 ├── docs/          Documentation
-│   └── debug.md               # GDB debug facility specification
+│   ├── debug.md               # GDB debug facility specification
+│   └── debug-impl-plan.md     # debug facility implementation status
 ├── LICENSE
 └── README.md
 ```
@@ -208,6 +212,7 @@ All traps vector to `MTVEC_ADDR`. The ISR reads `mcause` to dispatch.
 | `interrupt_request` | in | 1 | Maskable external interrupt (level, non-sticky) |
 | `nmi` | in | 1 | Non-maskable interrupt (level) |
 | `dbg_halt_req` | in | 1 | Debug halt request (level, highest priority) |
+| `pc_out` | out | `ADDR_WIDTH` | Current PC (feeds HW breakpoint comparators) |
 
 ### Instantiation example
 
@@ -365,6 +370,30 @@ Sorted by cell count:
 | rv32ic_full_aw12 | 20,605 | 1,450 | 126,804 | 5.02 | +5.98 | + SRA + perf CSRs |
 
 *(Full 25-config table available via `bash syn/run_syn.sh`.)*
+
+### RV32EMC configs (`syn/compare_emc.sh`)
+
+Four canonical RV32EMC configurations, all with `NRV_SRA`, `NRV_SINGLE_PORT_REGF`,
+`NRV_SHARED_ADDER`. Synthesized with `abc_default.script`. Sky130 HD, AW=12.
+
+| Config | Description | Cells | FFs | Area (µm²) |
+|---|---|---:|---:|---:|
+| A | parallel mul + parallel shift | 10,946 | 889 | 87,250 |
+| **B** | **serial mul + parallel shift** | **5,831** | **993** | **54,390** |
+| C | parallel mul + serial shift | 10,653 | 928 | 87,021 |
+| D | serial mul + serial shift | 5,496 | 1,032 | 54,117 |
+
+### Radix-2 vs Radix-4 Booth multiplier (`syn/compare_abc.sh`)
+
+Config B variant (serial mul + parallel shift), RV32EMC, AW=12, `abc_default.script`:
+
+| Multiplier | Cycles / mul | Cells | FFs | Area (µm²) | Δ vs R2 |
+|---|---:|---:|---:|---:|---|
+| Radix-2 (`NRV_SERIAL_MUL`) | 32–33 | 5,831 | 993 | 54,390 | — |
+| Radix-4 Booth (`+NRV_RADIX4_MUL`) | 17–18 | 6,297 | 1,028 | 59,181 | +466 cells, +4,791 µm² (+8.8%) |
+
+Radix-4 Booth nets ~1.27× speedup on multiply-heavy workloads (see Section 10)
+for ~9% extra area on a Config-B base.
 
 ---
 
