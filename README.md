@@ -239,7 +239,66 @@ AttoRV32 #(
 
 ---
 
-## 5. Bus Wrappers
+## 5. Memory Map
+
+Two reference memory layouts ship with the repo: the **standalone firmware**
+layout used by `sim/tb.v` and all `sw/` firmware (selftest, main, benchmarks),
+and the **debug SoC** layout used by `rtl/attorv32_dbg.v`. They are
+independent — a given build uses one or the other.
+
+### 5.1 Standalone firmware (`sim/tb.v` + `sw/link.ld.in`)
+
+Single flat RAM of `2^ADDR_WIDTH` bytes (default 4 KiB at `ADDR_WIDTH=12`).
+Code and data share the space. The top 16 bytes are reserved for
+memory-mapped I/O decoded by the testbench.
+
+```
+0x0000           .reset     Reset trampoline (<= 16 bytes)
+0x0010           .isr       ISR entry (matches MTVEC_ADDR = 0x10)
+0x0014 ...       .text      Program code (.rodata, .data, .bss follow)
+ ...
+RAM_END - 16     IO_DONE    Write any -> $finish (0 = PASS, !0 = FAIL)
+RAM_END - 12     IO_DEBUG   Write low byte -> character to $write (printf)
+RAM_END -  8     IO_IRQ_STS Read: pending IRQ status
+RAM_END -  4     IO_IRQ_CLR Write: clear IRQ + IRQ source
+RAM_END          __ram_end  (stack grows down from IO_DONE)
+```
+
+The linker exports `__ram_end`; firmware derives MMIO addresses as
+`__ram_end - 16/12/8/4`. See `sw/bench_compute.c` and `sw/selftest.c` for
+typical usage. `MTVEC_ADDR = 0x010` is hardcoded so `crt0.S` can place the
+trap handler at a known address without relocation.
+
+### 5.2 Debug SoC (`rtl/attorv32_dbg.v`)
+
+Page-aligned split RAM / ROM / I/O, decoded from `mem_addr[15:12]`. Default
+`RAM_AW = 12` (4 KiB each of RAM and ROM) gives `ADDR_WIDTH = 14`.
+
+```
+0x0000 - 0x0FFF : RAM  (4 KiB - synchronous SRAM, reset vector here)
+0x1000 - 0x1FFF : ROM  (4 KiB - combinational GDB stub, MTVEC_ADDR here)
+0x2000 - 0x2FFF : I/O  (16 peripheral slots x 256 bytes)
+```
+
+I/O slot 0 (0x2000 – 0x20FF) — **System Control** (8 sub-slots × 32 bytes,
+decoded from `mem_addr[7:5]`; 8 word registers per sub-slot via
+`mem_addr[4:2]`):
+
+| Sub-slot | Address | Block | Registers |
+|---|---|---|---|
+| 0 | `0x2000` | UART | `DATA` (reg 0), `STATUS` (reg 1: `{LOCKED, RX_VALID, TX_READY}`) |
+| 1 | `0x2020` | HW breakpoints | `BP_CTRL`, `BP_HIT`, `BP_COUNT`, `BP_ADDR[0..3]` |
+| 2 | `0x2040` | System Timer | *(TBD)* |
+| 3 | `0x2060` | PIC | *(TBD)* |
+| 4 | `0x2080` | Clocking | *(TBD)* |
+| 5 | `0x20A0` | Control | write `CTRL` → `$finish` (simulation only) |
+| 6–7 | `0x20C0–0x20FF` | *(reserved)* | — |
+
+I/O slots 1–15 (`0x2100–0x2FFF`) are free for user peripherals.
+
+---
+
+## 6. Bus Wrappers
 
 ### AHB-Lite (`rtl/attorv32_ahbl.v`)
 
@@ -259,30 +318,11 @@ Reference integration for GDB debugging. Instantiates:
 - **Hardware breakpoints** (`rtl/hw_bkpt.v`) — 4 PC-match comparators
 - **UART break detector** → `dbg_halt_req` (4-bit counter in sim, 12-bit-period in synthesis)
 
-Memory map (with `RAM_AW=12`, `ADDR_WIDTH=14`):
-
-```
-0x0000 – 0x0FFF : RAM  (4 KiB)
-0x1000 – 0x1FFF : stub ROM  (4 KiB, combinational, traps land here)
-0x2000 – 0x2FFF : I/O  (16 peripheral slots × 256 bytes)
-```
-
-I/O slot 0 (0x2000) — System Control (8 sub-slots × 32 bytes):
-
-| Sub-slot | Address | Block |
-|---|---|---|
-| 0 | `0x2000` | UART (DATA, STATUS) |
-| 1 | `0x2020` | HW breakpoints (CTRL, HIT, COUNT, ADDR[0–3]) |
-| 2 | `0x2040` | System Timer (TBD) |
-| 3 | `0x2060` | PIC (TBD) |
-| 4 | `0x2080` | Clocking (TBD) |
-| 5 | `0x20A0` | Control ($finish in sim) |
-
-Slots 1–15 (0x2100–0x2FFF) available for user peripherals.
+Memory map and register layout: see Section 5.2.
 
 ---
 
-## 6. Debug Facility
+## 7. Debug Facility
 
 See [`docs/debug.md`](docs/debug.md) for the full specification.
 
@@ -318,7 +358,7 @@ build workflow, GDB example session, and known limitations.
 
 ---
 
-## 7. Operation
+## 8. Operation
 
 ### 7.1 State machine
 
@@ -347,7 +387,7 @@ FETCH_INSTR → WAIT_INSTR → [FETCH_RS2] → EXECUTE → (WAIT | WAIT_INSTR | 
 
 ---
 
-## 8. Synthesis Results — Sky130A
+## 9. Synthesis Results — Sky130A
 
 Synthesized with **yosys 0.57** + a custom timing-driven ABC script (see
 `syn/abc_timing.script`) against `sky130_fd_sc_hd__tt_025C_1v80`. Target
@@ -392,12 +432,12 @@ Config B variant (serial mul + parallel shift), RV32EMC, AW=12, `abc_default.scr
 | Radix-2 (`NRV_SERIAL_MUL`) | 32–33 | 5,831 | 993 | 54,390 | — |
 | Radix-4 Booth (`+NRV_RADIX4_MUL`) | 17–18 | 6,297 | 1,028 | 59,181 | +466 cells, +4,791 µm² (+8.8%) |
 
-Radix-4 Booth nets ~1.27× speedup on multiply-heavy workloads (see Section 10)
+Radix-4 Booth nets ~1.27× speedup on multiply-heavy workloads (see Section 11)
 for ~9% extra area on a Config-B base.
 
 ---
 
-## 9. Verification
+## 10. Verification
 
 ```bash
 bash sim/run_tb.sh        # 7 configs, ~10k cycles each → 7/7 PASS
@@ -423,7 +463,7 @@ riscv64-elf-gdb build/dbg_test/dbg_test.elf \
 
 ---
 
-## 10. Benchmarks
+## 11. Benchmarks
 
 CPI (Cycles Per Instruction) measured on **Config B**: RV32EMC, serial mul,
 parallel shift, single-port regfile, shared adder, SRA (`NRV_M NRV_SRA
@@ -467,7 +507,7 @@ vvp build/sim/bench.vvp +hex=sw/bench_sort.hex    +timeout=2000000
 
 ---
 
-## 11. Credits
+## 12. Credits
 
 - **FemtoRV32** and **Gracilis** core design: Bruno Levy, Matthias Koch
   (2020–2021). https://github.com/BrunoLevy/learn-fpga
