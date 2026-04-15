@@ -143,10 +143,17 @@ module AttoRV32 #(
 
    wire isALU = isALUimm | isALUreg;
 
-   // SYSTEM funct3=000 decodes strictly into MRET vs env-trap (ECALL/EBREAK).
+   // SYSTEM funct3=000 decodes strictly into MRET, WFI, or env-trap
+   // (ECALL/EBREAK).  WFI (instr[31:20]=0x105) is a *hint* and is decoded
+   // here as a distinct non-trapping instruction so it doesn't get
+   // misrouted as EBREAK (0x00100073 is EBREAK; WFI is 0x10500073 which
+   // shares instr[20]=1 with EBREAK and would otherwise land in the
+   // is_env_trap bucket). Tier-0 behavior: NOP. Tier-1 behavior: stall
+   // until wake (see wfi_stall below).
    wire is_sys_zero = isSYSTEM & funct3Is[0];
    wire is_mret     = is_sys_zero & (instr[31:20] == 12'h302);
-   wire is_env_trap = is_sys_zero & ~is_mret;   // ECALL or EBREAK
+   wire is_wfi      = is_sys_zero & (instr[31:20] == 12'h105);
+   wire is_env_trap = is_sys_zero & ~is_mret & ~is_wfi;   // ECALL or EBREAK
    wire is_ecall    = is_env_trap & ~instr[20]; // 0x000 = ECALL, 0x001 = EBREAK
 
    /***************************************************************************/
