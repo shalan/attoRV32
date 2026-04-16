@@ -178,6 +178,13 @@ All traps vector to `MTVEC_ADDR`. The ISR reads `mcause` to dispatch.
   at any time, even inside an ISR with interrupts disabled. Reports
   `mcause=3` (same as EBREAK) so a GDB stub handles it transparently.
   Drive from a UART break detector for GDB Ctrl-C support.
+- **WFI** stalls the pipeline in S_EXECUTE until a wake event
+  (`interrupt_request | nmi | dbg_halt_req`). Wake is ungated by MIE —
+  per RISC-V spec, WFI must wake on any pending interrupt even when
+  interrupts are disabled. If the interrupt isn't actually accepted,
+  execution continues past WFI. For async traps during WFI, `mepc`
+  captures WFI+4 so the handler returns *past* the WFI instruction.
+  Cost: 3 cycles + stall wait. `minstret` does not tick during stall.
 - **MRET** restores `PC ← mepc`, clears `mcause` (re-enables IRQ/NMI).
 - `mstatus.MIE` is not auto-cleared on trap entry (no MPIE stack). To
   mask IRQs in software: `csrrci mstatus, 8`.
@@ -383,6 +390,7 @@ FETCH_INSTR → WAIT_INSTR → [FETCH_RS2] → EXECUTE → (WAIT | WAIT_INSTR | 
 | Multiply (serial, radix-2) | 3 + 32–33 |
 | Multiply (serial, radix-4 Booth) | 3 + 17–18 |
 | Divide / Remainder | 3 + 32 |
+| WFI | 3 + wait (stalls until IRQ/NMI/dbg_halt) |
 | Trap entry | 1 |
 
 ---
