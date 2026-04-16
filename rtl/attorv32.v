@@ -599,6 +599,16 @@ module AttoRV32 #(
    wire trap_entry         = interrupt_accepted | env_trap_accepted
                            | nmi_accepted       | dbg_halt_accepted;
 
+   // WFI (Tier 1) — stall S_EXECUTE until a wake event arrives. Wake is the
+   // raw union of asynchronous sources, deliberately ungated by MIE/mcause
+   // (spec: WFI must wake on pending interrupts even when MIE=0; if the
+   // interrupt isn't actually accepted, execution simply continues past
+   // the WFI). The normal trap_entry path above fires on the same cycle
+   // when the source is accepted, so mepc ends up capturing PC_new (WFI+4)
+   // via the async-trap branch — i.e., the handler returns *past* WFI.
+   wire wfi_wake  = interrupt_request | nmi | dbg_halt_req;
+   wire wfi_stall = is_wfi & (state == S_EXECUTE) & ~wfi_wake;
+
    wire interrupt_return   = is_mret;
 
    reg [ADDR_WIDTH-1:0] mepc;
@@ -619,7 +629,7 @@ module AttoRV32 #(
    /*     complete when S_WAIT finishes.                                  */
    /*   - Traps in S_EXECUTE count as retired (RISC-V convention).        */
    wire instr_retired =
-        (state == S_EXECUTE && !needToWait)                          |
+        (state == S_EXECUTE && !needToWait && !wfi_stall)            |
         (state == S_EXECUTE && needToWait && trap_entry)             |
         (state == S_WAIT    && !aluBusy && !mem_rbusy && !mem_wbusy) ;
    always @(posedge clk) begin
@@ -899,7 +909,14 @@ module AttoRV32 #(
 `endif
 
             S_EXECUTE: begin
-               if (trap_entry) begin
+               if (wfi_stall) begin
+                  // Tier-1 WFI: hold PC and state until wake. Memory bus
+                  // goes quiet (mem_rstrb=0, mem_wmask=0 — WFI is a
+                  // SYSTEM-class instruction, not a load/store/fetch).
+                  // A wake event is handled on the very next cycle:
+                  // either via trap_entry (accepted IRQ/NMI/dbg_halt) or
+                  // by falling through to PC <= PC_new = WFI+4.
+               end else if (trap_entry) begin
                   PC         <= MTVEC_ADDR;
                   skip_fetch <= 1'b0;
                   // env_trap never waits (not a load/store/divide);

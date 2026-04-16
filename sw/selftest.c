@@ -250,6 +250,20 @@ static void test_irq(void) {
 }
 
 /*---------------------------------------------------------------------------
+ * 8) WFI: the core must stall at WFI until an interrupt (or NMI/dbg_halt)
+ *    arrives, then resume past the WFI. We sample the tick counter before
+ *    and after — if WFI didn't block, we might still see progress from the
+ *    free-running IRQ source, but the point here is that WFI doesn't trap
+ *    (pre-fix it was decoded as EBREAK) and that tick_count advances.
+ *---------------------------------------------------------------------------*/
+static void test_wfi(void) {
+    __asm__ volatile ("csrsi mstatus, 8");      /* MIE on */
+    uint32_t t0 = tick_count;
+    __asm__ volatile ("wfi" ::: "memory");
+    CHECK(tick_count > t0);                     /* at least one IRQ served */
+}
+
+/*---------------------------------------------------------------------------
  * main — run each test; if no CHECK fails, write 0 to IO_DONE.
  *---------------------------------------------------------------------------*/
 int main(void) {
@@ -265,6 +279,7 @@ int main(void) {
 #endif
     test_ebreak();
     test_irq();
+    test_wfi();
 
     done_pass();
     return 0;
