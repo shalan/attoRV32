@@ -1,0 +1,11 @@
+AttoRV32
+Copyright 2024-2026 Mohamed Shalan <mshalan@aucegypt.edu>
+                    (https://github.com/shalan)
+
+This product includes software developed as part of the FemtoRV32 /
+Gracilis project by Bruno Levy and Matthias Koch (2020-2024), which is
+distributed under the BSD 3-Clause License. The upstream copyright notice
+and license text are reproduced in the LICENSE file and must be retained
+in all source redistributions.
+
+Upstream project: https://github.com/BrunoLevy/learn-fpga

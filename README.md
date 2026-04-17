@@ -520,6 +520,7 @@ vvp build/sim/bench.vvp +hex=sw/bench_sort.hex    +timeout=2000000
 - **FemtoRV32** and **Gracilis** core design: Bruno Levy, Matthias Koch
   (2020–2021). https://github.com/BrunoLevy/learn-fpga
 - AttoRV32 (minimization, serial arithmetic, NMI, debug halt,
-  combinational ROM stub, AHB-Lite wrapper, Sky130A flow): 2026.
+  combinational ROM stub, AHB-Lite wrapper, Sky130A flow):
+  Mohamed Shalan <mshalan@aucegypt.edu> (https://github.com/shalan), 2026.
 
-Licensed under BSD-3-Clause (see `LICENSE`).
+Licensed under the Apache License, Version 2.0 (see `LICENSE`).
